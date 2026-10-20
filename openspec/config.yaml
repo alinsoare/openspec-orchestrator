@@ -1,0 +1,86 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+context: |
+  This repo is the openspec-orchestrator engine itself, not a target project.
+  The installed files are skills/openspec-orchestrator/ (SKILL.md,
+  AUTONOMOUS-ORCHESTRATION.md, CONTEXT.md, models.tsv, scripts/) and agents/.
+  The Installer copies the skill directory whole, so nothing the engine needs
+  at run time may live outside it. tests/, openspec/, docs/ and README.md stay
+  at the repo root and are not installed. Tests are tests/run.sh, which runs the
+  independent tests/t-*.sh files in parallel (helpers in tests/lib.sh; the
+  no-caller function scan in t-00-static.sh is the dead-code pass). Every change
+  to installed files adds exactly one Release (## <version>, newest first) to
+  the root CHANGELOG.md, which CI enforces with tools/check-release-bump.sh.
+  Comments state non-obvious rationale only. A change
+  that adds an orchestration.* key, a role, or a convention updates the
+  example block and this context in the same change; Verify warns otherwise.
+  orchestration.tool names the host agent tool (claude-code, cursor, copilot,
+  codex, opencode; unset means claude-code) and selects the models.tsv
+  column and the per-tier agent set next names.
+  Project notes per role live in openspec/roles/<role>.md (proposer, critic,
+  worker, unit-critic, verifier) and are appended to that role's dispatch.
+  The engine's own prompts live at skills/openspec-orchestrator/scripts/roles/<role>.md and print before
+  the store's overlay; inside those prompts anchor repetition is kept, not
+  deduplicated, unlike terse human-facing prose. Grill mode (SKILL.md) is
+  the only pre-change mode and the only writer of a root's Project glossary
+  (openspec/CONTEXT.md) and ADRs (openspec/adr/); the proposer and critic
+  read them.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
+
+# Autonomous orchestration (optional, read by scripts/run-change in the
+# openspec-orchestrator engine — see AUTONOMOUS-ORCHESTRATION.md there).
+# Single rule: this block lives ONLY in a store's openspec/config.yaml.
+# Target projects must not contain an openspec/ folder at all — run-change
+# refuses any project that does.
+# Example:
+#   orchestration:
+#     tool: claude-code       # host agent tool: claude-code|cursor|copilot|codex|opencode
+#     concurrency: 2          # change-level slots (default 2)
+#     unit_concurrency: 3     # units in flight per change (default 3)
+#     parallel: true          # false = one unit per change
+#     gate_quick: "npm run lint && npm run typecheck"
+#     gate_ui: "npx playwright test"   # UI units only, after gate_quick
+#     unit_max_files: 8 / unit_max_tasks: 3   # unit size cap; unit_size_ok state field exempts a justified unit
+#     gate_full: "npm test && npx knip"
+#     model_mechanical / model_standard / model_deep / model_max: per-tier overrides
+#     checker_effort: high    # lets a checker share the generator's model
+#     stage_skills: { plan: <skill>, critic: [<skill>], test: [<skill>] }
+# Role overlays (not keys): openspec/roles/<role>.md, see AUTONOMOUS-ORCHESTRATION.md.
+# gate_full must include the project's dead-code pass (knip, vulture, ...):
+# tests cannot see the abandoned helpers and unused deps agents leave.
+# This orchestrator gates its own engine scripts with tests/run.sh, whose
+# no-caller function scan is the dead-code pass for bash.
+orchestration:
+  concurrency: 1
+  unit_concurrency: 3
+  gate_quick: "bash -n skills/openspec-orchestrator/scripts/run-change && bash -n skills/openspec-orchestrator/scripts/lib.sh"
+  gate_full: "./tests/run.sh"

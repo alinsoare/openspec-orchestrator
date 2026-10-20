@@ -1,0 +1,1135 @@
+#!/usr/bin/env bash
+# Mechanical half of AUTONOMOUS-ORCHESTRATION.md: workspace/slot/gate/merge-lane
+# and state bookkeeping. Does not propose, implement, fix, or verify —
+# that's the calling agent's job, using the existing openspec-orchestrator
+# phases. This script only does the "none"-tier work (see AUTONOMOUS-
+# ORCHESTRATION.md model/effort routing).
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+source scripts/lib.sh
+
+usage() {
+  cat >&2 <<'EOF'
+usage: run-change <command> [args]
+
+  slot acquire   --store <slug> --project <path>
+  slot release   --store <slug> --slot <id>
+  workspace create --store <slug> --project <path> --name <change>
+  workspace remove  --store <slug> --project <path> --name <change>
+  gate run       --store <slug> --project <path> --name <change> --mode quick|full [--unit <u>]
+  gate run       --store <slug> --project <path> --mode full --trunk
+  units check    --store <slug> --name <change>
+  units next     --store <slug> --name <change>
+  units list     --store <slug> --name <change>
+  units merge-order --store <slug> --name <change>
+  units ready-for-review --store <slug> --name <change>
+  units single   --store <slug> --name <change> [--ui]
+  unit create    --store <slug> --project <path> --name <change> --unit <u>
+  unit remove    --store <slug> --project <path> --name <change> --unit <u>
+  unit get       --store <slug> --name <change> --unit <u>
+  unit set       --store <slug> --name <change> --unit <u> [key value ...]
+  unit checks-done --store <slug> --project <path> --name <change> --unit <u>
+  unit iterate   --store <slug> --project <path> --name <change> --unit <u>
+  unit merge     --store <slug> --project <path> --name <change> --unit <u>
+  unit pass      --store <slug> --name <change> --unit <u>
+  model get      --store <slug> --tier mechanical|standard|deep|max
+  models refresh --store <slug>
+  model verify   --store <slug> --name <change>
+  model critic   --store <slug> --name <change> [--unit <u>]
+  stage-skills get --store <slug> --stage plan|critic|test
+  roles get      --store <slug> --role proposer|critic|worker|unit-critic|verifier
+  openspec       --store <slug> [--name <change>] -- <openspec args>
+  roles prompt   --store <slug> --role proposer|critic|worker|unit-critic|verifier
+  merge-lane run --store <slug> --project <path> --name <change>
+  tasks open     --store <slug> --name <change>
+  state init|get|set --store <slug> --name <change> [key value ...]
+  initiative init|get|set --store <slug> --name <initiative> [key value ...]
+  initiative merged --store <slug> --name <initiative> --child <change> --commit <sha>
+  session append --store <slug> --name <change> key value [key value ...]
+  advisor request --store <slug> --name <change> --worker <transcript-id> [--unit <u>]
+  session list   --store <slug> --name <change>
+  status         --store <slug>
+  next           --store <slug> --name <change>
+EOF
+  exit 1
+}
+
+parse_opts() {
+  # Fills STORE, PROJECT, NAME, MODE, SLOT, TIER, STAGE, TRUNK, UNIT, UI from
+  # remaining args. TRUNK and UI are bare flags (0/1), not --key value pairs.
+  STORE=""; PROJECT=""; NAME=""; MODE=""; SLOT=""; TIER=""; CHILD=""; COMMIT=""; WORKER=""; STAGE=""; ROLE=""; TRUNK=0; UNIT=""; UI=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --worker) WORKER="$2"; shift 2 ;;
+      --child) CHILD="$2"; shift 2 ;;
+      --commit) COMMIT="$2"; shift 2 ;;
+      --store) STORE="$2"; shift 2 ;;
+      --project) PROJECT="$2"; shift 2 ;;
+      --name) NAME="$2"; shift 2 ;;
+      --mode) MODE="$2"; shift 2 ;;
+      --slot) SLOT="$2"; shift 2 ;;
+      --tier) TIER="$2"; shift 2 ;;
+      --stage) STAGE="$2"; shift 2 ;;
+      --role) ROLE="$2"; shift 2 ;;
+      --unit) UNIT="$2"; shift 2 ;;
+      --trunk) TRUNK=1; shift ;;
+      --ui) UI=1; shift ;;
+      *) shift ;;
+    esac
+  done
+}
+
+# kv_args "$@" -> PAIRS holds the key/value args left after the --flags
+# parse_opts consumed. Every command that takes trailing pairs uses this.
+kv_args() {
+  PAIRS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --store|--project|--name|--mode|--slot|--tier|--stage|--role|--child|--commit|--worker|--unit) shift 2 ;; --trunk|--ui) shift ;; *) PAIRS+=("$1"); shift ;; esac
+  done
+}
+
+# set_record <file> key value [key value ...] — the one upsert path for
+# change state and initiative records. Convergence needs the previous
+# checker result, so whenever a real last_*_result is about to be
+# overwritten — by a new result or by the "" written before a recheck — it
+# is shifted into prev_*_result here, mechanically. Overwriting an empty
+# value shifts nothing, so the round the next report is compared against
+# survives the clear. The orchestrator never writes prev_* itself.
+set_record() {
+  local f="$1"; shift
+  local i key cur
+  for ((i = 0; i + 1 < $#; i += 2)); do
+    key="${@:i+1:1}"
+    case "$key" in last_verify_result|last_critique_result) ;; *) continue ;; esac
+    cur="$(state_field "$f" "$key")"
+    [ -n "$cur" ] && state_write "$f" "prev_${key#last_}" "$cur"
+  done
+  state_write "$f" "$@"
+}
+
+cmd_slot_acquire() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] || usage
+  guard_project_openspec "$STORE" "$PROJECT"
+  local dir; dir="$(orchestration_dir "$STORE")/slots"
+  mkdir -p "$dir"
+  local cap; cap="$(concurrency_cap "$STORE")"
+  local i
+  for i in $(seq 1 "$cap"); do
+    if mkdir "$dir/$i" 2>/dev/null; then
+      echo "$i"
+      return 0
+    fi
+  done
+  echo "no free slot (cap=$cap) for store $STORE" >&2
+  return 1
+}
+
+cmd_slot_release() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$SLOT" ] || usage
+  local dir; dir="$(orchestration_dir "$STORE")/slots"
+  rmdir "$dir/$SLOT" 2>/dev/null || true
+}
+
+cmd_workspace_create() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] || usage
+  guard_project_openspec "$STORE" "$PROJECT"
+  ensure_project_git "$PROJECT"
+  local branch="change/$NAME"
+  local wt_path; wt_path="$(workspace_path "$STORE" "$NAME")"
+  mkdir -p "$(dirname "$wt_path")"
+  ensure_workspace_ignored "$STORE"
+  git -C "$PROJECT" worktree add -b "$branch" "$wt_path" >&2
+  echo "$wt_path"
+}
+
+cmd_workspace_remove() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] || usage
+  # Unit worktrees/branches first — the change branch they were cut from
+  # must outlive them while they're being torn down. Unit paths come only
+  # from workspace_path (the sole builder of workspace paths), and the
+  # branch delete is unconditional on the dir existing, so a unit whose
+  # worktree is already gone (an interrupted unit remove, a manual prune)
+  # still loses its branch. The units field may not be the only source of
+  # truth for what's checked out, so the workspaces dir is also scanned
+  # for <name>.<unit> entries (names only; the path is rebuilt through
+  # workspace_path), then any surviving change/<name>.* ref is deleted.
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  local units_v=""
+  [ -f "$f" ] && units_v="$(state_field "$f" units)"
+  local u
+  for u in $(map_keys "$units_v"); do
+    local d; d="$(workspace_path "$STORE" "$NAME" "$u")"
+    git -C "$PROJECT" worktree remove "$d" --force 2>/dev/null || true
+    git -C "$PROJECT" branch -D "$(unit_branch "$NAME" "$u")" 2>/dev/null || true
+  done
+  local wsdir; wsdir="$(orchestration_dir "$STORE")/workspaces"
+  local d
+  for d in "$wsdir/$NAME".*; do
+    [ -d "$d" ] || continue
+    local unit="${d##*/$NAME.}"
+    git -C "$PROJECT" worktree remove "$(workspace_path "$STORE" "$NAME" "$unit")" --force 2>/dev/null || true
+    git -C "$PROJECT" branch -D "$(unit_branch "$NAME" "$unit")" 2>/dev/null || true
+  done
+  local ref
+  for ref in $(git -C "$PROJECT" for-each-ref --format='%(refname:short)' "refs/heads/change/$NAME.*" 2>/dev/null); do
+    git -C "$PROJECT" branch -D "$ref" 2>/dev/null || true
+  done
+  local wt_path; wt_path="$(workspace_path "$STORE" "$NAME")"
+  git -C "$PROJECT" worktree remove "$wt_path" --force 2>/dev/null || true
+  git -C "$PROJECT" branch -D "change/$NAME" 2>/dev/null || true
+}
+
+# Trunk preflight: runs gate_full against a detached worktree of trunk_ref
+# so a pre-existing red trunk is caught before any change opens, instead of
+# turning into a mid-run detour on whichever change happens to touch it
+# first. Never writes state (gate_tree belongs to a change's own tree, not
+# trunk's), never needs --name (no change exists yet), and always cleans
+# the temporary worktree up via an EXIT trap, green or red.
+cmd_gate_run_trunk() {
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$MODE" ] || usage
+  guard_project_openspec "$STORE" "$PROJECT"
+  local gcmd; gcmd="$(gate_command "$STORE" "$MODE")"
+  [ -n "$gcmd" ] || { echo "no orchestration.gate_${MODE} configured in $(store_config "$STORE")" >&2; return 1; }
+  local ref; ref="$(trunk_ref "$PROJECT")"
+  local wsdir; wsdir="$(orchestration_dir "$STORE")/workspaces"
+  mkdir -p "$wsdir"
+  ensure_workspace_ignored "$STORE"
+  local tmp; tmp="$(mktemp -d "$wsdir/trunk-preflight.XXXXXX")"
+  rmdir "$tmp"
+  trap "$(printf 'git -C %q worktree remove --force %q >/dev/null 2>&1 || true; git -C %q worktree prune >/dev/null 2>&1 || true' "$PROJECT" "$tmp" "$PROJECT")" EXIT
+  git -C "$PROJECT" worktree add --detach "$tmp" "$ref" >&2
+  local status=0
+  ( cd "$tmp" && run_gate "$STORE" "$gcmd" ) || status=$?
+  [ "$status" -eq 0 ] || echo "trunk $ref is red under gate_full: exit $status" >&2
+  return "$status"
+}
+
+# The gate runs in the change's worktree — the tree that actually holds the
+# branch's code. The project's main checkout is trunk and would pass or fail
+# for reasons unrelated to the change.
+cmd_gate_run() {
+  parse_opts "$@"
+  if [ "$TRUNK" = 1 ]; then
+    local trunk_status=0
+    cmd_gate_run_trunk || trunk_status=$?
+    return "$trunk_status"
+  fi
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] && [ -n "$MODE" ] || usage
+  guard_project_openspec "$STORE" "$PROJECT"
+  local gcmd; gcmd="$(gate_command "$STORE" "$MODE")"
+  [ -n "$gcmd" ] || { echo "no orchestration.gate_${MODE} configured in $(store_config "$STORE")" >&2; return 1; }
+  local wt
+  if [ -n "$UNIT" ]; then
+    wt="$(workspace_path "$STORE" "$NAME" "$UNIT")"
+  else
+    wt="$(workspace_path "$STORE" "$NAME")"
+  fi
+  [ -d "$wt" ] || { echo "no workspace for change $NAME (expected $wt) — run workspace create first" >&2; return 1; }
+  ( cd "$wt" && run_gate "$STORE" "$gcmd" )
+  # A passing full gate records the tree it ran on. merge-lane skips its
+  # rerun when the merged tree is identical: same tree, same result.
+  # --unit means this ran in a unit's worktree, not the change's tree, so
+  # gate_tree (which names the change branch's tree) is never written here.
+  if [ "$MODE" = full ] && [ -z "$UNIT" ]; then
+    local sf="$(state_root "$STORE")/$NAME.yaml"
+    if [ -f "$sf" ]; then
+      state_write "$sf" gate_tree "$(git -C "$wt" rev-parse 'HEAD^{tree}')"
+    fi
+  fi
+}
+
+# --- units (parallel-units) -------------------------------------------------
+
+cmd_units_check() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  units_check "$STORE" "$NAME" || return 1
+  local dir
+  dir="$(change_dir "$STORE" "$NAME" 2>/dev/null)" || return 0
+  local tasks="$dir/tasks.md"
+  [ -f "$tasks" ] || return 0
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  local unit_tasks_v; unit_tasks_v="$(state_field "$f" unit_tasks)"
+  local assigned=","
+  local u
+  for u in $(map_keys "$unit_tasks_v"); do
+    local old_ifs="$IFS"; IFS=','
+    local t
+    for t in $(map_get "$unit_tasks_v" "$u"); do
+      [ -n "$t" ] || continue
+      assigned="$assigned$t,"
+    done
+    IFS="$old_ifs"
+  done
+  local line id
+  while IFS= read -r line; do
+    id="$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*-[[:space:]]\[[ x]\][[:space:]]+([0-9]+\.[0-9]+).*/\1/p')"
+    [ -n "$id" ] || continue
+    case "$assigned" in
+      *",$id,"*) ;;
+      *) echo "unassigned: $id" ;;
+    esac
+  done < "$tasks"
+}
+
+cmd_units_next() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  units_ready "$STORE" "$NAME"
+}
+
+cmd_units_list() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  local units_v; units_v="$(state_field "$f" units)"
+  local udir; udir="$(unit_state_dir "$STORE" "$NAME")"
+  local u
+  for u in $(map_keys "$units_v"); do
+    local uf="$udir/$u.yaml"
+    if [ -f "$uf" ]; then
+      printf '%s %s %s\n' "$u" "$(state_field "$uf" status)" "$(state_field "$uf" iterations)"
+    else
+      printf '%s %s %s\n' "$u" pending 0
+    fi
+  done
+}
+
+cmd_units_merge_order() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  units_merge_order "$STORE" "$NAME"
+}
+
+cmd_units_ready_for_review() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  local units_v; units_v="$(state_field "$f" units)"
+  local udir; udir="$(unit_state_dir "$STORE" "$NAME")"
+  local u
+  for u in $(map_keys "$units_v"); do
+    local uf="$udir/$u.yaml"
+    [ -f "$uf" ] || continue
+    [ "$(state_field "$uf" status)" = green ] || continue
+    [ -z "$(state_field "$uf" critique)" ] || continue
+    echo "unit: $u"
+    local dir="$udir/$u" png
+    [ -d "$dir" ] || continue
+    for png in "$dir"/screenshot-*.png; do
+      [ -e "$png" ] || continue
+      echo "screenshot: $png"
+    done
+  done
+}
+
+# units single [--ui]: the none-tier split for lifecycle light or
+# parallel false -- one unit "all" holding the union of the seam files and
+# every tasks.md id.
+cmd_units_single() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  [ -f "$f" ] || cmd_state_init --store "$STORE" --name "$NAME"
+  local seams_v; seams_v="$(state_field "$f" seams)"
+  local all_files="" sk
+  for sk in $(map_keys "$seams_v"); do
+    local sf; sf="$(map_get "$seams_v" "$sk")"
+    all_files="${all_files:+$all_files,}$sf"
+  done
+  state_write "$f" units "all=$all_files"
+  local dir ids=""
+  dir="$(change_dir "$STORE" "$NAME" 2>/dev/null)" || dir=""
+  if [ -n "$dir" ] && [ -f "$dir/tasks.md" ]; then
+    local line id
+    while IFS= read -r line; do
+      id="$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*-[[:space:]]\[[ x]\][[:space:]]+([0-9]+\.[0-9]+).*/\1/p')"
+      [ -n "$id" ] || continue
+      ids="${ids:+$ids,}$id"
+    done < "$dir/tasks.md"
+  fi
+  state_write "$f" unit_tasks "all=$ids"
+  if [ "$UI" = 1 ]; then
+    state_write "$f" ui_units "all"
+  fi
+}
+
+# unit create --store --project --name --unit: branches change/<name>.<u>
+# off the tip of change/<name>, checks it out at the unit's workspace path,
+# and records its state file. Unit writers always run at `standard` -- no
+# --tier option here.
+cmd_unit_create() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  local units_v; units_v="$(state_field "$f" units)"
+  case " $(map_keys "$units_v") " in
+    *" $UNIT "*) ;;
+    *) echo "unknown unit '$UNIT' for change $NAME" >&2; return 1 ;;
+  esac
+  local udir; udir="$(unit_state_dir "$STORE" "$NAME")"
+  mkdir -p "$udir"
+  local uf="$udir/$UNIT.yaml"
+  if [ -f "$uf" ]; then
+    local st; st="$(state_field "$uf" status)"
+    [ "$st" = pending ] || { echo "unit $UNIT already exists with status '$st'" >&2; return 1; }
+  fi
+  local unit_deps_v; unit_deps_v="$(state_field "$f" unit_deps)"
+  local d
+  for d in $(map_get "$unit_deps_v" "$UNIT" | tr ',' ' '); do
+    [ -n "$d" ] || continue
+    local dstf="$udir/$d.yaml"
+    { [ -f "$dstf" ] && [ "$(state_field "$dstf" status)" = merged ]; } \
+      || { echo "unit $UNIT depends on '$d', which is not merged" >&2; return 1; }
+  done
+  local change_wt; change_wt="$(workspace_path "$STORE" "$NAME")"
+  [ -d "$change_wt" ] || { echo "no change workspace for $NAME (expected $change_wt)" >&2; return 1; }
+  [ -z "$(git -C "$change_wt" status --porcelain)" ] \
+    || { echo "refusing: change worktree $change_wt has uncommitted changes" >&2; return 1; }
+  local branch; branch="$(unit_branch "$NAME" "$UNIT")"
+  local unit_wt; unit_wt="$(workspace_path "$STORE" "$NAME" "$UNIT")"
+  mkdir -p "$(dirname "$unit_wt")"
+  git -C "$PROJECT" worktree add -b "$branch" "$unit_wt" "change/$NAME" >&2
+  local base; base="$(git -C "$PROJECT" rev-parse "change/$NAME")"
+  local tier; tier="$(unit_tier "$STORE" "$NAME" "$UNIT")"
+  cat > "$uf" <<EOF
+unit: $UNIT
+status: running
+tier: $tier
+iterations: 0
+base: $base
+checks_commit: ""
+screenshot: ""
+critique: ""
+merge_attempts: 0
+created_at: "$(timestamp)"
+updated_at: "$(timestamp)"
+EOF
+  echo "$unit_wt"
+}
+
+cmd_unit_remove() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  local unit_wt; unit_wt="$(workspace_path "$STORE" "$NAME" "$UNIT")"
+  git -C "$PROJECT" worktree remove "$unit_wt" --force 2>/dev/null || true
+  git -C "$PROJECT" branch -D "$(unit_branch "$NAME" "$UNIT")" 2>/dev/null || true
+}
+
+cmd_unit_get() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  local uf="$(unit_state_dir "$STORE" "$NAME")/$UNIT.yaml"
+  [ -f "$uf" ] || { echo "no unit $UNIT for change $NAME" >&2; return 1; }
+  cat "$uf"
+}
+
+# unit set: generic upsert through set_record, plus the one rule the engine
+# enforces rather than trusting the critic — a UI unit's critique may only
+# claim `critique` once its report quotes the unit's recorded screenshot
+# path (the absolute path unit iterate recorded for the latest green
+# iteration) verbatim.
+cmd_unit_set() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  local uf="$(unit_state_dir "$STORE" "$NAME")/$UNIT.yaml"
+  [ -f "$uf" ] || { echo "no unit $UNIT for change $NAME" >&2; return 1; }
+  kv_args "$@"
+  local i
+  for ((i = 0; i + 1 < ${#PAIRS[@]}; i += 2)); do
+    if [ "${PAIRS[$i]}" = fail_reason ]; then
+      case "${PAIRS[$((i + 1))]}" in
+        spec|iteration-cap|red-after-advice|merge-conflict|"") ;;
+        *) echo "unknown fail_reason '${PAIRS[$((i + 1))]}' (expected spec|iteration-cap|red-after-advice|merge-conflict)" >&2; return 1 ;;
+      esac
+    fi
+    [ "${PAIRS[$i]}" = critique ] || continue
+    local f="$(state_root "$STORE")/$NAME.yaml"
+    local ui_units_v; ui_units_v="$(state_field "$f" ui_units)"
+    case ",$ui_units_v," in
+      *",$UNIT,"*)
+        local shot; shot="$(state_field "$uf" screenshot)"
+        [ -n "$shot" ] || continue
+        local report; report="$(unit_state_dir "$STORE" "$NAME")/$UNIT.critique.md"
+        [ -f "$report" ] || { echo "no critique report at $report" >&2; return 1; }
+        grep -qF "$shot" "$report" \
+          || { echo "critique report $report does not contain the recorded screenshot path ($shot) as a fixed string" >&2; return 1; }
+        ;;
+    esac
+  done
+  set_record "$uf" ${PAIRS[@]+"${PAIRS[@]}"}
+}
+
+cmd_unit_checks_done() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  local uf="$(unit_state_dir "$STORE" "$NAME")/$UNIT.yaml"
+  [ -f "$uf" ] || { echo "no unit $UNIT for change $NAME" >&2; return 1; }
+  local unit_wt; unit_wt="$(workspace_path "$STORE" "$NAME" "$UNIT")"
+  local head; head="$(git -C "$unit_wt" rev-parse HEAD)"
+  local base; base="$(state_field "$uf" base)"
+  [ "$head" != "$base" ] \
+    || { echo "refusing: unit $UNIT HEAD still equals its base — write and commit the checks first" >&2; return 1; }
+  state_write "$uf" checks_commit "$head"
+}
+
+# unit iterate: the engine runs the checks itself (gate_quick, in the unit
+# worktree), so the worker never reports its own result.
+cmd_unit_iterate() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  local uf="$(unit_state_dir "$STORE" "$NAME")/$UNIT.yaml"
+  [ -f "$uf" ] || { echo "no unit $UNIT for change $NAME" >&2; return 1; }
+  local checks_commit; checks_commit="$(state_field "$uf" checks_commit)"
+  [ -n "$checks_commit" ] \
+    || { echo "refusing: unit $UNIT has no checks_commit yet — run unit checks-done first" >&2; return 1; }
+  local iterations; iterations="$(state_field "$uf" iterations)"; iterations="${iterations:-0}"
+  local n=$((iterations + 1))
+  if [ "$n" -gt "$UNIT_ITER_CAP" ]; then
+    state_write "$uf" status failed
+    state_write "$uf" fail_reason iteration-cap
+    echo "unit $UNIT: iteration cap ($UNIT_ITER_CAP) reached" >&2
+    return 1
+  fi
+  # Two consecutive reds mean the worker is stuck, not unlucky: the next
+  # iterate is refused until the advisor has been asked for this unit.
+  local reds; reds="$(state_field "$uf" reds_in_row)"; reds="${reds:-0}"
+  local advised; advised="$(state_field "$uf" advised)"
+  if [ "$reds" -ge "$REDS_BEFORE_ADVISOR" ] && [ -z "$advised" ]; then
+    echo "refusing: unit $UNIT is red $reds times in a row — advisor required first: scripts/run-change advisor request --store $STORE --name $NAME --unit $UNIT --worker <transcript-id>, apply the answer, then iterate" >&2
+    return 1
+  fi
+  local gcmd; gcmd="$(gate_command "$STORE" quick)"
+  [ -n "$gcmd" ] || { echo "no orchestration.gate_quick configured in $(store_config "$STORE")" >&2; return 1; }
+  local unit_wt; unit_wt="$(workspace_path "$STORE" "$NAME" "$UNIT")"
+  local shotdir; shotdir="$(unit_state_dir "$STORE" "$NAME")/$UNIT"
+  mkdir -p "$shotdir"
+  local shot="$shotdir/screenshot-$n.png"
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  local ui_units_v; ui_units_v="$(state_field "$f" ui_units)"
+  local is_ui=0; case ",$ui_units_v," in *",$UNIT,"*) is_ui=1 ;; esac
+  # gate_ui (browser tests) runs only for a UI unit, after gate_quick, so
+  # non-UI units never pay for Playwright on every iteration.
+  local ucmd=""; [ "$is_ui" = 1 ] && ucmd="$(gate_command "$STORE" ui)"
+  local status_run=0
+  local both="$gcmd"; [ -z "$ucmd" ] || both="( $gcmd ) && ( $ucmd )"
+  ( cd "$unit_wt" && export UNIT_SCREENSHOT="$shot" UNIT_NAME="$UNIT" && run_gate "$STORE" "$both" ) || status_run=$?
+  local result=green
+  [ "$status_run" -eq 0 ] || result=red
+  [ "$is_ui" = 1 ] && { [ -f "$shot" ] || result=red; }
+  local tier; tier="$(unit_logged_tier "$STORE" "$NAME" "$UNIT")"
+  local model; model="$(model_for_tier "$STORE" "$tier")"
+  session_append "$(session_log_path "$STORE" "$NAME")" \
+    role worker phase unit unit "$UNIT" event iterate iteration "$n" checks "$result" tier "$tier" model "$model"
+  state_write "$uf" iterations "$n"
+  [ -f "$shot" ] && state_write "$uf" screenshot "$shot"
+  if [ "$result" = green ]; then
+    state_write "$uf" status green
+    state_write "$uf" reds_in_row 0
+  else
+    reds=$((reds + 1)); state_write "$uf" reds_in_row "$reds"
+    if [ -n "$advised" ]; then
+      # Red after the advisor's answer was applied: the human decides now,
+      # not at the cap.
+      state_write "$uf" status failed
+      state_write "$uf" fail_reason red-after-advice
+      echo "unit $UNIT: red after the advisor's answer (iteration $n) — escalating to Gate 1" >&2
+    elif [ "$n" -eq "$UNIT_ITER_CAP" ]; then
+      state_write "$uf" status failed
+      state_write "$uf" fail_reason iteration-cap
+    elif [ "$reds" -ge "$REDS_BEFORE_ADVISOR" ]; then
+      echo "unit $UNIT: red $reds times in a row — advisor required before the next iterate" >&2
+    fi
+  fi
+  [ "$result" = green ]
+}
+
+# unit merge: rebases the unit branch onto change/<name>, refuses scope
+# creep, fast-forwards the change branch on success, ticks its tasks.md
+# ids, and removes the unit worktree/branch.
+# unit pass: the engine, not the orchestrator, decides a unit may skip its
+# critic — every condition is re-checked here, so a stray call cannot wave
+# a unit through.
+cmd_unit_pass() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  unit_pass_eligible "$STORE" "$NAME" "$UNIT" || return 1
+  local uf; uf="$(unit_state_dir "$STORE" "$NAME")/$UNIT.yaml"
+  state_write "$uf" status reviewed
+  state_write "$uf" critique skipped
+  session_append "$(session_log_path "$STORE" "$NAME")" role orchestrator phase unit unit "$UNIT" event critique-skipped reason light-leaf-green-first-iteration
+}
+
+cmd_unit_merge() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] && [ -n "$UNIT" ] || usage
+  local udir; udir="$(unit_state_dir "$STORE" "$NAME")"
+  local uf="$udir/$UNIT.yaml"
+  [ -f "$uf" ] || { echo "no unit $UNIT for change $NAME" >&2; return 1; }
+  local status; status="$(state_field "$uf" status)"
+  case "$status" in
+    reviewed|resolving) ;;
+    *) echo "unit $UNIT is not reviewed or resolving (status: $status)" >&2; return 1 ;;
+  esac
+
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  local unit_deps_v; unit_deps_v="$(state_field "$f" unit_deps)"
+  local d
+  for d in $(map_get "$unit_deps_v" "$UNIT" | tr ',' ' '); do
+    [ -n "$d" ] || continue
+    local dstf="$udir/$d.yaml"
+    { [ -f "$dstf" ] && [ "$(state_field "$dstf" status)" = merged ]; } \
+      || { echo "unit $UNIT depends on '$d', which is not merged" >&2; return 1; }
+  done
+
+  local unit_wt; unit_wt="$(workspace_path "$STORE" "$NAME" "$UNIT")"
+  local branch; branch="$(unit_branch "$NAME" "$UNIT")"
+  local change_wt; change_wt="$(workspace_path "$STORE" "$NAME")"
+  local slog; slog="$(session_log_path "$STORE" "$NAME")"
+
+  if [ "$status" = resolving ] && unit_rebase_in_progress "$unit_wt"; then
+    git -C "$unit_wt" rebase --abort >/dev/null 2>&1 || true
+    state_write "$uf" status failed
+    session_append "$slog" role orchestrator phase unit unit "$UNIT" event merge result failed
+    echo "unit $UNIT: a rebase from a prior resolving attempt was still in progress — aborted" >&2
+    return 3
+  fi
+
+  # Scope check: the unit branch's diff from its merge-base with
+  # change/<name> may only touch the unit's own files (a directory entry
+  # covers every path under it).
+  local units_v; units_v="$(state_field "$f" units)"
+  local allowed; allowed="$(map_get "$units_v" "$UNIT")"
+  local mb; mb="$(git -C "$unit_wt" merge-base "change/$NAME" "$branch")"
+  local changed; changed="$(git -C "$unit_wt" diff --name-only "$mb" "$branch")"
+  local bad="" line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path_covered "$line" "$allowed" || bad="$bad $line"
+  done <<< "$changed"
+  if [ -n "$bad" ]; then
+    echo "unit $UNIT: outside unit files:$bad" >&2
+    return 1
+  fi
+
+  [ -z "$(git -C "$change_wt" status --porcelain)" ] \
+    || { echo "refusing: change worktree $change_wt has uncommitted changes" >&2; return 1; }
+
+  if ! git -C "$unit_wt" rebase "change/$NAME" >/dev/null 2>&1; then
+    local conflicts; conflicts="$(git -C "$unit_wt" diff --name-only --diff-filter=U)"
+    git -C "$unit_wt" rebase --abort >/dev/null 2>&1 || true
+    local attempts; attempts="$(state_field "$uf" merge_attempts)"; attempts="${attempts:-0}"
+    if [ "$attempts" -ge 1 ]; then
+      state_write "$uf" merge_attempts $((attempts + 1)) status failed
+      session_append "$slog" role orchestrator phase unit unit "$UNIT" event merge result failed
+      echo "unit $UNIT: rebase conflict (attempt $((attempts + 1))): $conflicts" >&2
+    else
+      state_write "$uf" merge_attempts $((attempts + 1)) status conflict
+      session_append "$slog" role orchestrator phase unit unit "$UNIT" event merge result conflict
+      echo "unit $UNIT: rebase conflict: $conflicts" >&2
+    fi
+    return 3
+  fi
+
+  git -C "$change_wt" merge --ff-only "$branch" >/dev/null
+
+  local dir; dir="$(change_dir "$STORE" "$NAME" 2>/dev/null)" || dir=""
+  if [ -n "$dir" ] && [ -f "$dir/tasks.md" ]; then
+    local unit_tasks_v; unit_tasks_v="$(state_field "$f" unit_tasks)"
+    local ids; ids="$(map_get "$unit_tasks_v" "$UNIT")"
+    local old_ifs="$IFS"; IFS=','
+    local id
+    for id in $ids; do
+      [ -n "$id" ] || continue
+      local esc_id; esc_id="$(printf '%s' "$id" | sed 's/\./\\./g')"
+      awk -v id="$esc_id" '
+        $0 ~ "^[[:space:]]*- \\[ \\][[:space:]]+" id "([^0-9.]|$)" { sub(/\[ \]/, "[x]") }
+        { print }
+      ' "$dir/tasks.md" > "$dir/tasks.md.tmp" && mv "$dir/tasks.md.tmp" "$dir/tasks.md"
+    done
+    IFS="$old_ifs"
+    case "$dir" in
+      "$change_wt"/*)
+        git -C "$change_wt" add -- "${dir#$change_wt/}/tasks.md"
+        git -C "$change_wt" commit -q -m "Tick $UNIT tasks
+
+Change: $NAME"
+        ;;
+    esac
+  fi
+
+  cmd_unit_remove --store "$STORE" --project "$PROJECT" --name "$NAME" --unit "$UNIT"
+  state_write "$uf" status merged
+  session_append "$slog" role orchestrator phase unit unit "$UNIT" event merge result merged
+}
+
+cmd_model_get() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$TIER" ] || usage
+  local m; m="$(model_for_tier "$STORE" "$TIER")" || exit 1
+  echo "$m"
+  print_fallback "$TIER" "$m"
+}
+# print_fallback <tier> <model> -- `fallback: <model>`, nothing when the tier
+# has none or the dispatch already runs on it (checker_model)
+print_fallback() {
+  local fb; fb="$(fallback_if_any "$STORE" "$1")"
+  [ -z "$fb" ] || [ "$fb" = "$2" ] || echo "fallback: $fb"
+}
+
+# Only cursor and opencode document a model-listing command; elsewhere the
+# catalogue is used as-is.
+# Codex has no list command; its cache holds the models this account may use.
+codex_models() {
+  python3 -c 'import json,os,sys; d=json.load(open(os.path.expanduser("~/.codex/models_cache.json"))); print("\n".join(m["slug"] for m in d["models"] if m.get("visibility")=="list"))'
+}
+
+cmd_models_refresh() {
+  parse_opts "$@"
+  [ -n "$STORE" ] || usage
+  local tool cmd; tool="$(host_tool "$STORE")" || exit 1
+  case "$tool" in cursor) cmd="agent models" ;; opencode) cmd="opencode models" ;; codex) cmd="codex_models" ;; *) echo "$tool has no model listing; catalogue used as-is"; return 0 ;; esac
+  [ "$cmd" = codex_models ] || command -v "${cmd%% *}" >/dev/null || { echo "${cmd%% *} not on PATH; catalogue used as-is"; return 0; }
+  local out; out="$(models_list_file "$STORE" "$tool")"
+  mkdir -p "$(dirname "$out")"
+  # Cursor lists every effort/thinking/fast variant as its own id but accepts the bare id, which the catalogue uses.
+  local strip='cat'; [ "$tool" = cursor ] && strip="sed -E -e :a -e s/-(fast|thinking|none|minimal|low|medium|high|xhigh|max|extra-high)\$// -e ta"
+  local tmp; tmp="$(mktemp "$out.XXXXXX")"
+  if ! $cmd 2>/dev/null | grep -oE '[A-Za-z0-9][A-Za-z0-9._/:-]+' | $strip | sort -u > "$tmp"; then
+    rm -f "$tmp"; echo "model listing for $tool failed; $out left as it was" >&2; return 1
+  fi
+  mv "$tmp" "$out"
+  echo "wrote $(wc -l < "$out" | tr -d ' ') ids to $out"
+}
+
+print_checker_effort() {
+  local e; e="$(checker_effort "$STORE")"
+  [ -n "$e" ] && echo "effort: $e"; return 0
+}
+
+cmd_model_verify() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local pick; pick="$(verify_pick "$STORE" "$NAME")" || exit 1
+  local m; m="$(printf '%s\n' "$pick" | cut -f2)"
+  echo "$m"
+  print_fallback "$(printf '%s\n' "$pick" | cut -f1)" "$m"
+  print_checker_effort
+  checker_inputs verify "$STORE" "$NAME"
+}
+
+cmd_model_critic() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  if [ -n "$UNIT" ]; then
+    local pick; pick="$(unit_critic_pick "$STORE" "$NAME" "$UNIT")" || exit 1
+    echo "${pick#*$'\t'}"
+    print_fallback "${pick%%$'\t'*}" "${pick#*$'\t'}"
+    print_checker_effort
+    checker_inputs unit-critic "$STORE" "$NAME" "$UNIT"
+  else
+    local pick; pick="$(critic_pick "$STORE" "$NAME")" || exit 1
+    echo "${pick#*$'\t'}"
+    print_fallback "${pick%%$'\t'*}" "${pick#*$'\t'}"
+    print_checker_effort
+    checker_inputs critic "$STORE" "$NAME"
+  fi
+}
+
+cmd_stage_skills_get() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$STAGE" ] || usage
+  stage_skills "$STORE" "$STAGE"
+}
+
+# roles get: prints the overlay's text (not its path) so the orchestrator
+# can paste it into the dispatch verbatim; empty output when the store has
+# none for that role.
+cmd_roles_get() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$ROLE" ] || usage
+  local f; f="$(role_overlay "$STORE" "$ROLE")" || return 1
+  [ -n "$f" ] && cat "$f"
+  return 0
+}
+
+# roles prompt: the engine prompt, then (if any) a blank line and the
+# overlay, so the engine-before-overlay order is fixed here rather than
+# left to the orchestrator.
+cmd_roles_prompt() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$ROLE" ] || usage
+  local p f
+  p="$(role_prompt "$ROLE")" || return 1
+  f="$(role_overlay "$STORE" "$ROLE")" || return 1
+  cat "$p"
+  [ -n "$f" ] && { printf '\n'; cat "$f"; }
+  return 0
+}
+
+cmd_merge_lane_run() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$PROJECT" ] && [ -n "$NAME" ] || usage
+  guard_project_openspec "$STORE" "$PROJECT"
+  local dir; dir="$(orchestration_dir "$STORE")"
+  mkdir -p "$dir"
+  local lock="$dir/merge.lock"
+  local tries=0
+  until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 60 ] || { echo "merge lane busy for store $STORE" >&2; return 1; }
+    sleep 1
+  done
+  trap 'rmdir "'"$lock"'" 2>/dev/null || true' EXIT
+  local ref; ref="$(trunk_ref "$PROJECT")"
+  local wt; wt="$(workspace_path "$STORE" "$NAME")"
+  git -C "$wt" merge "$ref" --no-edit
+  local sf="$(state_root "$STORE")/$NAME.yaml" tree
+  tree="$(git -C "$wt" rev-parse 'HEAD^{tree}')"
+  if [ -f "$sf" ] && [ "$(state_field "$sf" gate_tree)" = "$tree" ]; then
+    echo "full gate already green on this exact tree ($tree); skipping rerun" >&2
+    return 0
+  fi
+  cmd_gate_run --store "$STORE" --project "$PROJECT" --name "$NAME" --mode full
+}
+
+# tasks open: prints every unchecked tasks.md line for a change and records
+# the count as manual_tasks_open so next_action can block archive on it —
+# the engine owns the count; a hand-counted value is not trusted to guard
+# `archive --yes`.
+cmd_tasks_open() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local dir
+  dir="$(change_dir "$STORE" "$NAME")" || { echo "no change directory found for $NAME in store $STORE" >&2; return 1; }
+  local sf="$(state_root "$STORE")/$NAME.yaml"
+  [ -f "$sf" ] || cmd_state_init --store "$STORE" --name "$NAME"
+  local tasks="$dir/tasks.md"
+  if [ ! -f "$tasks" ]; then
+    echo "no tasks.md for $NAME"
+    state_write "$sf" manual_tasks_open 0
+    return 0
+  fi
+  local n=0 line
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*'- [ ]' ]]; then
+      echo "$line"
+      n=$((n + 1))
+    fi
+  done < "$tasks"
+  state_write "$sf" manual_tasks_open "$n"
+}
+
+cmd_state_init() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local root; root="$(state_root "$STORE")"
+  mkdir -p "$root"
+  local f="$root/$NAME.yaml"
+  [ -f "$f" ] && return 0
+  cat > "$f" <<EOF
+name: $NAME
+phase: proposed
+propose_rounds: 0
+last_critique_result: ""
+prev_critique_result: ""
+acceptance: ""
+fix_attempts: 0
+last_gate_result: ""
+gate_tree: ""
+last_verify_result: ""
+prev_verify_result: ""
+lifecycle: full
+pillars: ""
+grill: ""
+units: ""
+unit_deps: ""
+unit_tasks: ""
+ui_units: ""
+parallel: ""
+manual_tasks_open: ""
+manual_accept: ""
+initiative: ""
+depends_on: []
+seams: []
+follows: ""
+supersedes: ""
+blocked_on: ""
+created_at: "$(timestamp)"
+updated_at: "$(timestamp)"
+EOF
+}
+
+cmd_state_get() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  cat "$(state_root "$STORE")/$NAME.yaml"
+}
+
+cmd_state_set() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local f="$(state_root "$STORE")/$NAME.yaml"
+  [ -f "$f" ] || cmd_state_init --store "$STORE" --name "$NAME"
+  kv_args "$@"
+  set_record "$f" ${PAIRS[@]+"${PAIRS[@]}"}
+}
+
+cmd_session_append() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local f; f="$(session_log_path "$STORE" "$NAME")"
+  kv_args "$@"
+  # advisor entries are written only by `advisor request`, which checks the
+  # caps first — a direct append would bypass them.
+  local i
+  for ((i = 0; i + 1 < ${#PAIRS[@]}; i += 2)); do
+    if [ "${PAIRS[$i]}" = "role" ] && [ "${PAIRS[$((i + 1))]}" = "advisor" ]; then
+      echo "role advisor is reserved: use 'advisor request --worker <transcript-id>' so the cap is enforced" >&2
+      return 1
+    fi
+  done
+  session_append "$f" ${PAIRS[@]+"${PAIRS[@]}"}
+}
+
+# advisor request: the only way to spend an advisor call. Refuses when the
+# change has used ADVISOR_CAP calls or this worker has already asked once;
+# otherwise logs the entry (the reservation) and prints the deep model id.
+cmd_advisor_request() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] && [ -n "$WORKER" ] || usage
+  local used; used="$(advisor_calls "$STORE" "$NAME")"
+  if [ "$used" -ge "$ADVISOR_CAP" ]; then
+    echo "advisor cap reached for $NAME ($used/$ADVISOR_CAP): the change was mis-tiered — note it in the verify report and escalate the task" >&2
+    return 1
+  fi
+  if [ "$(advisor_calls_for "$STORE" "$NAME" "$WORKER")" -ge 1 ]; then
+    echo "worker $WORKER already used its one advisor call on $NAME: the task is not routine — return and re-dispatch one tier up" >&2
+    return 1
+  fi
+  local model; model="$(model_for_tier "$STORE" deep)"
+  if [ -n "$UNIT" ]; then
+    local uf; uf="$(unit_state_dir "$STORE" "$NAME")/$UNIT.yaml"
+    [ -f "$uf" ] || { echo "no unit $UNIT for change $NAME" >&2; return 1; }
+    local it; it="$(state_field "$uf" iterations)"; it="${it:-0}"
+    state_write "$uf" advised "$it"
+    session_append "$(session_log_path "$STORE" "$NAME")" role advisor tier deep model "$model" for "$WORKER" unit "$UNIT"
+  else
+    session_append "$(session_log_path "$STORE" "$NAME")" role advisor tier deep model "$model" for "$WORKER"
+  fi
+  echo "$model"
+}
+
+
+cmd_session_list() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local f; f="$(session_log_path "$STORE" "$NAME")"
+  [ -f "$f" ] && cat "$f" || true
+}
+
+cmd_initiative_init() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local root; root="$(initiative_root "$STORE")"
+  mkdir -p "$root"
+  local f="$root/$NAME.yaml"
+  [ -f "$f" ] && return 0
+  cat > "$f" <<EOF
+name: $NAME
+title: ""
+request: ""
+children: []
+critique_rounds: 0
+last_critique_result: ""
+prev_critique_result: ""
+merged: ""
+created_at: "$(timestamp)"
+updated_at: "$(timestamp)"
+EOF
+}
+
+cmd_initiative_get() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  cat "$(initiative_root "$STORE")/$NAME.yaml"
+}
+
+cmd_initiative_set() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  local f="$(initiative_root "$STORE")/$NAME.yaml"
+  [ -f "$f" ] || cmd_initiative_init --store "$STORE" --name "$NAME"
+  kv_args "$@"
+  set_record "$f" ${PAIRS[@]+"${PAIRS[@]}"}
+}
+
+# initiative merged: record the squash-merge commit of one child in the
+# initiative's `merged` map ("child=sha,child=sha", upserted). The child
+# must be listed in `children` — an unlisted child merging under this
+# initiative means the record and the work disagree.
+cmd_initiative_merged() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] && [ -n "$CHILD" ] && [ -n "$COMMIT" ] || usage
+  local f="$(initiative_root "$STORE")/$NAME.yaml"
+  [ -f "$f" ] || { echo "no initiative $NAME in store $STORE" >&2; return 1; }
+  case ",$(state_field "$f" children)," in
+    *",$CHILD,"*) ;;
+    *) echo "$CHILD is not a child of initiative $NAME" >&2; return 1 ;;
+  esac
+  local cur; cur="$(state_field "$f" merged)"
+  local out="" pair kept=0
+  IFS=',' read -ra pairs <<< "$cur"
+  for pair in ${pairs[@]+"${pairs[@]}"}; do
+    [ -n "$pair" ] || continue
+    if [ "${pair%%=*}" = "$CHILD" ]; then pair="$CHILD=$COMMIT"; kept=1; fi
+    out="${out:+$out,}$pair"
+  done
+  [ "$kept" = 1 ] || out="${out:+$out,}$CHILD=$COMMIT"
+  state_write "$f" merged "$out"
+}
+
+cmd_next() {
+  parse_opts "$@"
+  [ -n "$STORE" ] && [ -n "$NAME" ] || usage
+  next_action "$STORE" "$NAME"
+}
+
+cmd_status() {
+  parse_opts "$@"
+  [ -n "$STORE" ] || usage
+  local root; root="$(state_root "$STORE")"
+  if [ ! -d "$root" ] || [ -z "$(ls -A "$root" 2>/dev/null)" ]; then
+    echo "no in-flight changes for store $STORE"
+    return 0
+  fi
+  printf "%-24s %-14s %-8s %-9s %-20s %-8s %-10s\n" "CHANGE" "PHASE" "FIXES" "ADVISOR" "BLOCKED_ON" "UNITS" "LAST_TIER"
+  local f name slog last_tier
+  for f in "$root"/*.yaml; do
+    name="$(state_field "$f" name)"
+    slog="$(session_log_path "$STORE" "$name")"
+    last_tier=""
+    # Last entry that actually carries a tier= field — a trailing
+    # orchestrator entry (e.g. event=merge) has none and must not mask the
+    # worker/critic tier before it.
+    [ -f "$slog" ] && last_tier="$(awk '/ tier=/{line=$0} END{if (line) print line}' "$slog" | grep -o 'tier=[^ ]*' | cut -d= -f2 || true)"
+    local units_v units_col
+    units_v="$(state_field "$f" units)"
+    units_col="-"
+    if [ -n "$units_v" ]; then
+      local total=0 merged=0 u
+      for u in $(map_keys "$units_v"); do
+        total=$((total + 1))
+        local uf="$(unit_state_dir "$STORE" "$name")/$u.yaml"
+        [ -f "$uf" ] && [ "$(state_field "$uf" status)" = merged ] && merged=$((merged + 1))
+      done
+      units_col="$merged/$total"
+    fi
+    printf "%-24s %-14s %-8s %-9s %-20s %-8s %-10s\n" \
+      "$name" \
+      "$(state_field "$f" phase)" \
+      "$(state_field "$f" fix_attempts)" \
+      "$(advisor_calls "$STORE" "$name")/$ADVISOR_CAP" \
+      "$(state_field "$f" blocked_on)" \
+      "$units_col" \
+      "${last_tier:--}"
+  done
+  local iroot; iroot="$(initiative_root "$STORE")"
+  [ -d "$iroot" ] && [ -n "$(ls -A "$iroot" 2>/dev/null)" ] || return 0
+  echo
+  printf "%-24s %-8s %-14s %s\n" "INITIATIVE" "ROUNDS" "CRITIQUE" "CHILDREN (merge order)"
+  local child cf merged sha
+  for f in "$iroot"/*.yaml; do
+    name="$(state_field "$f" name)"
+    merged=",$(state_field "$f" merged),"
+    printf "%-24s %-8s %-14s %s\n" "$name" \
+      "$(state_field "$f" critique_rounds)" \
+      "$(state_field "$f" last_critique_result)" \
+      "$(state_field "$f" children)"
+    # children is "a,b,c" in merge order; a merged child is reported from the
+    # initiative's `merged` map even after its state file is gone.
+    for child in $(state_field "$f" children | tr -d '[]' | tr ',' ' '); do
+      cf="$root/$child.yaml"
+      sha="${merged#*,$child=}"
+      if [ "$sha" != "$merged" ]; then
+        printf "  %-22s %-14s %s\n" "$child" "merged" "${sha%%,*}"
+      elif [ -f "$cf" ]; then
+        printf "  %-22s %-14s blocked_on=%s\n" "$child" "$(state_field "$cf" phase)" "$(state_field "$cf" blocked_on)"
+      else
+        printf "  %-22s %-14s\n" "$child" "not-started"
+      fi
+    done
+  done
+}
+
+# openspec: the OpenSpec CLI against the resolved root. External mode appends
+# --store <slug>. In local mode the root is the project checkout, but a
+# change's artifacts exist only on its branch, in the change worktree, so with
+# --name and a worktree holding openspec/ the CLI runs there, cwd-resolved —
+# the one place --store would miss them (external worktrees have no openspec/).
+cmd_openspec() {
+  local pre=() cli=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --) shift; cli=("$@"); break ;; *) pre+=("$1"); shift ;; esac
+  done
+  parse_opts "${pre[@]}"
+  [ -n "$STORE" ] && [ ${#cli[@]} -gt 0 ] || usage
+  store_path "$STORE" >/dev/null || exit 1
+  local wt=""
+  [ -z "$NAME" ] || wt="$(workspace_path "$STORE" "$NAME")"
+  if [ -n "$wt" ] && [ -d "$wt/openspec" ]; then
+    cd "$wt" && exec openspec "${cli[@]}"
+  fi
+  exec openspec "${cli[@]}" --store "$STORE"
+}
+
+[ $# -ge 1 ] || usage
+if [ "$1" = "status" ]; then shift; cmd_status "$@"; exit $?; fi
+if [ "$1" = "next" ]; then shift; cmd_next "$@"; exit $?; fi
+if [ "$1" = "openspec" ]; then shift; cmd_openspec "$@"; exit $?; fi
+group="$1"; sub="${2:-}"; shift 2 2>/dev/null || shift $#
+case "$group $sub" in
+  "slot acquire") cmd_slot_acquire "$@" ;;
+  "slot release") cmd_slot_release "$@" ;;
+  "workspace create") cmd_workspace_create "$@" ;;
+  "workspace remove") cmd_workspace_remove "$@" ;;
+  "gate run") cmd_gate_run "$@" ;;
+  "units check") cmd_units_check "$@" ;;
+  "units next") cmd_units_next "$@" ;;
+  "units list") cmd_units_list "$@" ;;
+  "units merge-order") cmd_units_merge_order "$@" ;;
+  "units ready-for-review") cmd_units_ready_for_review "$@" ;;
+  "units single") cmd_units_single "$@" ;;
+  "unit create") cmd_unit_create "$@" ;;
+  "unit remove") cmd_unit_remove "$@" ;;
+  "unit get") cmd_unit_get "$@" ;;
+  "unit set") cmd_unit_set "$@" ;;
+  "unit pass") cmd_unit_pass "$@" ;;
+  "unit checks-done") cmd_unit_checks_done "$@" ;;
+  "unit iterate") cmd_unit_iterate "$@" ;;
+  "unit merge") cmd_unit_merge "$@" ;;
+  "model get") cmd_model_get "$@" ;;
+  "models refresh") cmd_models_refresh "$@" ;;
+  "model verify") cmd_model_verify "$@" ;;
+  "model critic") cmd_model_critic "$@" ;;
+  "stage-skills get") cmd_stage_skills_get "$@" ;;
+  "roles get") cmd_roles_get "$@" ;;
+  "roles prompt") cmd_roles_prompt "$@" ;;
+  "merge-lane run") cmd_merge_lane_run "$@" ;;
+  "tasks open") cmd_tasks_open "$@" ;;
+  "state init") cmd_state_init "$@" ;;
+  "state get") cmd_state_get "$@" ;;
+  "state set") cmd_state_set "$@" ;;
+  "initiative init") cmd_initiative_init "$@" ;;
+  "initiative get") cmd_initiative_get "$@" ;;
+  "initiative set") cmd_initiative_set "$@" ;;
+  "initiative merged") cmd_initiative_merged "$@" ;;
+  "session append") cmd_session_append "$@" ;;
+  "advisor request") cmd_advisor_request "$@" ;;
+  "session list") cmd_session_list "$@" ;;
+  *) usage ;;
+esac
